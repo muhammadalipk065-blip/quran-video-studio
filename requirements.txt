@@ -1,5 +1,5 @@
 streamlit
 requests
 pillow
-moviepy
+moviepy==2.2.1
 numpy
