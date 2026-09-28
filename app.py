@@ -160,5 +160,21 @@ with st.expander("🔧 Diagnostics (typography check)"):
             st.image(_img, caption="Direct HarfBuzz render of ornamented verse")
         except Exception as _e:  # noqa: BLE001
             st.error(f"hb_render_line failed: {_e}")
+        # Exact video-path input: real API uthmani text, wrapped, size 100.
+        try:
+            _v = rv.api_get("/quran/verses/uthmani",
+                            {"chapter_number": 112})["verses"][0]["text_uthmani"]
+            _api_sample = rv.with_verse_ornament(_v, 1)
+            _diag2 = {
+                "api_tail_repr": ascii(_api_sample[-10:]),
+                "api_len": len(_api_sample),
+            }
+            _wlines = rv.wrap_arabic_hb(_api_sample, 100, 940)
+            _diag2["wrapped"] = [ascii(_l) for _l in _wlines]
+            st.json(_diag2)
+            _img2 = rv.hb_render_line(_wlines[0], 100, (255, 255, 255))
+            st.image(_img2, caption="Video-path render: API text, wrapped, size 100")
+        except Exception as _e2:  # noqa: BLE001
+            st.error(f"API-path diagnostics failed: {_e2}")
     else:
         st.warning("HarfBuzz renderer inactive — fallback path in use.")
