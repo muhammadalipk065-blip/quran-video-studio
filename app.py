@@ -136,3 +136,29 @@ if st.button("🎬 Generate video", type="primary", use_container_width=True):
 st.divider()
 st.caption("Audio: EveryAyah recitations · Text: Quran.com API · "
            "Check translation/recitation licensing before monetizing.")
+
+with st.expander("🔧 Diagnostics (typography check)"):
+    import sys as _sys
+    from importlib import metadata as _md
+    _diag = {
+        "python": _sys.version.split()[0],
+        "HAS_HB": bool(getattr(rv, "HAS_HB", False)),
+        "uharfbuzz": _md.version("uharfbuzz") if _md else "?",
+        "freetype-py": _md.version("freetype-py") if _md else "?",
+        "pillow": _md.version("pillow") if _md else "?",
+    }
+    _fp = getattr(rv, "FONT_AR_HB", "")
+    _diag["font_path"] = _fp
+    _diag["font_exists"] = os.path.exists(_fp)
+    _diag["font_bytes"] = os.path.getsize(_fp) if os.path.exists(_fp) else 0
+    _sample = rv.with_verse_ornament("قُلْ هُوَ اللَّهُ أَحَدٌ", 1)
+    _diag["ornamented_tail_repr"] = ascii(_sample[-8:])
+    st.json(_diag)
+    if _diag["HAS_HB"]:
+        try:
+            _img = rv.hb_render_line(_sample, 90, (255, 255, 255))
+            st.image(_img, caption="Direct HarfBuzz render of ornamented verse")
+        except Exception as _e:  # noqa: BLE001
+            st.error(f"hb_render_line failed: {_e}")
+    else:
+        st.warning("HarfBuzz renderer inactive — fallback path in use.")
