@@ -7,3 +7,4 @@ arabic-reshaper==3.0.1
 python-bidi==0.6.11
 uharfbuzz
 freetype-py
+pyarrow<25  # 25.x has a known segfault (apache/arrow#50471)
