@@ -604,7 +604,7 @@ def make_bg_clip(path, W, H, total):
         img = img.crop((x, y, x + W, y + H))
         bg = ImageClip(np.array(img)).with_duration(total)
     return bg.with_duration(total)
-    """F
+
 
 def resolve_background(arg):
     if arg is None:
@@ -690,7 +690,13 @@ def build(args):
     total_dur = full_audio.duration
 
     # -- video layers --
-    layers = []    
+    layers = []
+    if use_bg:
+        layers.append(make_bg_clip(bg_path, W, H, total_dur))
+        # cinematic dim so text stays readable over any backdrop
+        layers.append(ColorClip((W, H), color=(0, 0, 0))
+                      .with_duration(total_dur).with_opacity(0.45))
+
     def overlay(pil_img, dur):
         arr = np.array(pil_img)
         if use_bg:
@@ -711,16 +717,8 @@ def build(args):
     # The clips hold their own numpy copies now; release the PIL cards.
     del segments
     import gc
-    gc.collect(
-    
-    )
-    if use_bg:
-        layers.append(make_bg_clip(bg_path, W, H, total_dur))
-        # cinematic dim so text stays readable over any backdrop
-        layers.append(ColorClip((W, H), color=(0, 0, 0))
-                      .with_duration(total_dur).with_opacity(0.45))
+    gc.collect()
 
-    def overlay(
     final = CompositeVideoClip(layers, size=(W, H)).with_audio(full_audio)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
