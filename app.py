@@ -6,8 +6,9 @@ Run locally:
 Deploy free: push this folder to GitHub, then deploy at share.streamlit.io.
 """
 import os
+import subprocess
+import sys
 import tempfile
-from types import SimpleNamespace
 
 import requests
 import streamlit as st
@@ -108,21 +109,36 @@ if st.button("🎬 Generate video", type="primary", use_container_width=True):
     tag = "short" if vertical else "full"
     out_path = os.path.join(workdir, f"surah-{surah:03d}-{tag}.mp4")
 
-    args = SimpleNamespace(
-        surah=surah, verses=verses, reciter=reciter,
-        translation=int(translation), vertical=vertical,
-        channel=channel, background=bg_path, out=out_path,
-    )
+    # Run the render in a separate process: a heavy ffmpeg encode must never
+    # be able to take the whole Streamlit app down with it.
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    cmd = [sys.executable, os.path.join(repo_dir, "recitation_video.py"),
+           "--surah", str(surah),
+           "--reciter", reciter,
+           "--translation", str(int(translation)),
+           "--channel", channel,
+           "--background", bg_path,
+           "--out", out_path,
+           # veryfast: the container has limited RAM; x264 'medium'
+           # at 1080x1920 exhausts it and the process gets OOM-killed.
+           "--preset", "veryfast"]
+    if vertical:
+        cmd.append("--vertical")
+    if verses:
+        lo, hi = verses
+        cmd += ["--verses", f"{lo}-{hi}" if lo != hi else str(lo)]
 
     with st.spinner("Rendering your video — this usually takes a few "
                     "minutes. ☕"):
         try:
-            rv.build(args)
-        except SystemExit as e:
-            st.error(f"Couldn't build that video: {e}")
-            st.stop()
+            r = subprocess.run(cmd, capture_output=True, text=True)
         except Exception as e:  # noqa: BLE001
-            st.error(f"Something went wrong: {e}")
+            st.error(f"Couldn't start the render: {e}")
+            st.stop()
+        if r.returncode != 0 or not os.path.exists(out_path):
+            tail = (r.stderr or r.stdout or "")[-500:]
+            st.error("Couldn't build that video. "
+                     f"(render failed: {tail or 'unknown error'})")
             st.stop()
 
     st.success("Done! Preview below, or download the MP4.")
