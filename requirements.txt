@@ -1,0 +1,5 @@
+streamlit
+requests
+pillow
+moviepy
+numpy
