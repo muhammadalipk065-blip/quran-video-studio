@@ -45,6 +45,18 @@ HAS_RAQM = _pil_features.check("raqm") and os.environ.get("QRV_NO_RAQM") != "1"
 # Kwargs enabling RTL shaping at draw time -- only valid with libraqm.
 RTL = {"direction": "rtl"} if HAS_RAQM else {}
 
+# KFGQPC Uthmanic Hafs: the authentic Madani mushaf typeface (King Fahd
+# Glorious Quran Printing Complex). Rendered with HarfBuzz shaping +
+# FreeType rasterisation (see below) so diacritics, ligatures and marks
+# sit exactly as in the printed mushaf.
+try:
+    import uharfbuzz as _hb
+    import freetype as _ft
+    _HB_DEPS = True
+except Exception:  # optional dependency: fall back to Pillow/reshaper paths
+    _hb = _ft = None
+    _HB_DEPS = False
+
 
 # ----------------------------------------------------------------------------
 # Config
@@ -52,6 +64,8 @@ RTL = {"direction": "rtl"} if HAS_RAQM else {}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FONT_AR = os.path.join(BASE_DIR, "assets", "fonts", "AmiriQuran-Regular.ttf")
+FONT_AR_HB = os.path.join(BASE_DIR, "assets", "fonts", "KFGQPC-Hafs.ttf")
+HAS_HB = _HB_DEPS and os.path.exists(FONT_AR_HB)
 # Fallback Arabic fonts for environments without libraqm: unlike Amiri
 # Quran these carry Arabic presentation forms, so pre-shaped text
 # renders. Noto Naskh Arabic is a proper mushaf-style naskh;
@@ -149,10 +163,135 @@ def shape_arabic(text):
     return get_display(reshaper.reshape(text))
 
 
+# ----------------------------------------------------------------------------
+# Mushaf-quality Arabic rendering (HarfBuzz + FreeType)
+# ----------------------------------------------------------------------------
+# Pillow without libraqm cannot shape Arabic at all, and arabic_reshaper
+# only works with fonts that carry Arabic presentation forms -- which the
+# Madani mushaf typeface does not. So the primary renderer shapes with
+# HarfBuzz (real OpenType shaping: contextual forms, ligatures, mark
+# positioning) via uharfbuzz and rasterises each glyph with freetype-py.
+# Both are pure wheels: they work on Streamlit Cloud with no system
+# libraries, giving identical output locally and hosted.
+_hb_cache = {}
+
+
+def _hb_shaped(text, size):
+    """Shape Arabic text with HarfBuzz.
+
+    Returns (glyph_infos, glyph_positions, total_advance_px, ft_face).
+    HarfBuzz returns glyphs in left-to-right *visual* order with final
+    advances -- bidi reordering is already done, so the caller simply
+    draws the glyphs left to right, advancing the pen by x_advance.
+    """
+    if size not in _hb_cache:
+        blob = _hb.Blob.from_file_path(FONT_AR_HB)
+        hbf = _hb.Font(_hb.Face(blob))
+        hbf.scale = (size * 64, size * 64)
+        ftf = _ft.Face(FONT_AR_HB)
+        ftf.set_char_size(size * 64)
+        _hb_cache[size] = (hbf, ftf)
+    hbf, ftf = _hb_cache[size]
+    buf = _hb.Buffer()
+    buf.add_str(text)
+    buf.guess_segment_properties()
+    _hb.shape(hbf, buf, {"kern": True, "liga": True})
+    infos, poss = buf.glyph_infos, buf.glyph_positions
+    # uharfbuzz returns None for positions on empty text.
+    infos = infos or []
+    poss = poss or []
+    total = sum(p.x_advance for p in poss) / 64.0
+    return infos, poss, total, ftf
+
+
+def hb_text_width(text, size):
+    """Pixel width of Arabic text in the mushaf font (used for wrapping)."""
+    _, _, total, _ = _hb_shaped(text, size)
+    return abs(total)
+
+
+def hb_render_line(text, size, fill, stroke=False):
+    """Render one Arabic line with the mushaf font.
+
+    Returns a tightly cropped RGBA image of the ink, ready to paste.
+    Glyphs come from HarfBuzz in left-to-right visual order and are
+    drawn that way; the bidi reordering is already baked in.
+    """
+    from PIL import ImageChops, ImageFilter
+    if not text.strip():
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    infos, poss, total, ftf = _hb_shaped(text, size)
+    pad = int(size * 0.6)
+    W = int(abs(total)) + pad * 2
+    H = int(size * 2.8)
+    mask = Image.new("L", (W, H), 0)
+    baseline = int(H * 0.60)
+    pen = pad
+    x0, x1, y0, y1 = W, 0, H, 0
+    for gi, gp in zip(infos, poss):
+        adv = gp.x_advance / 64.0
+        gx = pen + gp.x_offset / 64.0
+        ftf.load_glyph(gi.codepoint,
+                       _ft.FT_LOAD_RENDER | _ft.FT_LOAD_TARGET_NORMAL)
+        bmp = ftf.glyph.bitmap
+        w, h = bmp.width, bmp.rows
+        if w and h:
+            left = int(gx + ftf.glyph.bitmap_left)
+            # HarfBuzz y grows up, PIL y grows down -> negate y_offset.
+            top = int(baseline - ftf.glyph.bitmap_top - gp.y_offset / 64.0)
+            gimg = Image.frombytes("L", (w, h), bytes(bmp.buffer))
+            tmp = Image.new("L", (W, H), 0)
+            tmp.paste(gimg, (left, top))
+            mask = ImageChops.lighter(mask, tmp)
+            x0, x1 = min(x0, left), max(x1, left + w)
+            y0, y1 = min(y0, top), max(y1, top + h)
+        pen += adv
+    cpad = max(4, int(size * 0.12))
+    box = (max(0, x0 - cpad), max(0, y0 - cpad),
+           min(W, x1 + cpad), min(H, y1 + cpad))
+    if box[2] <= box[0] or box[3] <= box[1]:
+        box = (0, 0, W, H)
+    mask_c = mask.crop(box)
+    img = Image.new("RGBA", mask_c.size, (0, 0, 0, 0))
+    if stroke:
+        sm = mask_c.filter(ImageFilter.MaxFilter(7))
+        img.paste((0, 0, 0, 255), (0, 0), sm)
+    img.paste(Image.new("RGBA", mask_c.size, fill + (255,)), (0, 0), mask_c)
+    return img
+
+
+def wrap_arabic_hb(text, size, max_w):
+    """Greedy word wrap measured with the mushaf font."""
+    lines, cur = [], ""
+    for w in text.split(" "):
+        t = (cur + " " + w).strip()
+        if hb_text_width(t, size) <= max_w or not cur:
+            cur = t
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def paste_line(img, line_img, cx, y_top):
+    """Paste a rendered Arabic line centred on cx, top edge at y_top."""
+    x, y = int(cx - line_img.width / 2), int(y_top)
+    if img.mode == "RGBA":
+        img.alpha_composite(line_img, (x, y))
+    else:
+        img.paste(line_img, (x, y), line_img)
+
+
 def with_verse_ornament(text, n):
     indic = str(n).translate(AR_DIGITS)
-    # non-breaking space: the ornament must never wrap onto its own line
-    return f"{text}\u00A0\uFD3F{indic}\uFD3E"
+    # The KFGQPC mushaf font renders Arabic-Indic digits inside the
+    # traditional ayah-end medallion on its own (multi-digit numbers
+    # share one medallion), so no extra mark character is needed. The
+    # non-breaking space keeps the ornament glued to the last word
+    # when wrapping.
+    return f"{text}\u00A0{indic}"
 
 
 def strip_html(text):
@@ -270,16 +409,30 @@ def draw_frame(W, H, header, arabic, english, footer, vertical=False,
         f_en = latin_font(46)
         f_foot = latin_font(34)
         ar_size = 100
-        while True:
-            f_ar = arabic_font(ar_size)
-            ar_lines = wrap_arabic(f_ar)
-            if (ar_size <= 60 or all(
-                    d.textlength(shape_arabic(l), font=f_ar, **RTL) <= max_w
-                    for l in ar_lines)):
-                break
-            ar_size -= 4
+        if HAS_HB:
+            # Mushaf font path: wrap and measure with HarfBuzz shaping.
+            while True:
+                ar_lines = wrap_arabic_hb(arabic, ar_size, max_w)
+                if (ar_size <= 60 or all(
+                        hb_text_width(l, ar_size) <= max_w
+                        for l in ar_lines)):
+                    break
+                ar_size -= 4
+            ar_imgs = [hb_render_line(l, ar_size, CREAM, stroke=transparent)
+                       for l in ar_lines]
+            line_h = max(im.height for im in ar_imgs) + int(ar_size * 0.45)
+        else:
+            while True:
+                f_ar = arabic_font(ar_size)
+                ar_lines = wrap_arabic(f_ar)
+                if (ar_size <= 60 or all(
+                        d.textlength(shape_arabic(l), font=f_ar, **RTL)
+                        <= max_w for l in ar_lines)):
+                    break
+                ar_size -= 4
+            ar_imgs = None
+            line_h = int(ar_size * 1.85)
         en_lines = wrap(d, english, f_en, max_w)
-        line_h = int(ar_size * 1.85)
         en_lh = 74
         head_h, gap1, gap2 = 62, 44, 58
         block_h = (head_h + gap1 + 2 + gap2
@@ -291,10 +444,15 @@ def draw_frame(W, H, header, arabic, english, footer, vertical=False,
         y += head_h + gap1
         d.line([(cx - 140, y), (cx + 140, y)], fill=GOLD, width=2)
         y += 2 + gap2
-        for line in ar_lines:
-            d.text((cx, y + line_h // 2), shape_arabic(line), font=f_ar,
-                   fill=CREAM, anchor="mm", **RTL, **stroke)
-            y += line_h
+        if HAS_HB:
+            for im in ar_imgs:
+                paste_line(img, im, cx, y + (line_h - im.height) // 2)
+                y += line_h
+        else:
+            for line in ar_lines:
+                d.text((cx, y + line_h // 2), shape_arabic(line), font=f_ar,
+                       fill=CREAM, anchor="mm", **RTL, **stroke)
+                y += line_h
         y += gap2
         for line in en_lines:
             d.text((cx, y), line, font=f_en, fill=GREY, anchor="ma", **stroke)
@@ -303,9 +461,8 @@ def draw_frame(W, H, header, arabic, english, footer, vertical=False,
                **stroke)
         return img
 
-    # Horizontal (16:9) layout — unchanged.
+    # Horizontal (16:9) layout.
     f_head = latin_font(34)
-    f_ar = arabic_font(76)
     f_en = latin_font(38)
     f_foot = latin_font(28)
 
@@ -315,15 +472,26 @@ def draw_frame(W, H, header, arabic, english, footer, vertical=False,
     d.line([(cx - 120, y), (cx + 120, y)], fill=GOLD, width=2)
     y += 70
 
-    # Arabic block (centred, wrapped). With libraqm the logical-order
-    # text is shaped at draw time (direction="rtl"); without it each
-    # line is pre-shaped to visual order by shape_arabic().
-    ar_lines = wrap_arabic(f_ar)
-    line_h = int(76 * 1.9)
-    for line in ar_lines:
-        d.text((cx, y + line_h // 2), shape_arabic(line), font=f_ar,
-               fill=CREAM, anchor="mm", **RTL, **stroke)
-        y += line_h
+    # Arabic block (centred, wrapped).
+    if HAS_HB:
+        ar_lines = wrap_arabic_hb(arabic, 76, max_w)
+        ar_imgs = [hb_render_line(l, 76, CREAM, stroke=transparent)
+                   for l in ar_lines]
+        line_h = max(im.height for im in ar_imgs) + int(76 * 0.45)
+        for im in ar_imgs:
+            paste_line(img, im, cx, y + (line_h - im.height) // 2)
+            y += line_h
+    else:
+        f_ar = arabic_font(76)
+        # With libraqm the logical-order text is shaped at draw time
+        # (direction="rtl"); without it each line is pre-shaped to
+        # visual order by shape_arabic().
+        ar_lines = wrap_arabic(f_ar)
+        line_h = int(76 * 1.9)
+        for line in ar_lines:
+            d.text((cx, y + line_h // 2), shape_arabic(line), font=f_ar,
+                   fill=CREAM, anchor="mm", **RTL, **stroke)
+            y += line_h
     y += 40
 
     # Translation
@@ -351,12 +519,19 @@ def title_frame(W, H, ch, reciter_name, translation_name, channel,
     f_sm = latin_font(28 if not vertical else 34)
 
     y = cy - (220 if not vertical else 320)
-    d.text((cx, y), shape_arabic(ch["name_arabic"]), font=f_ar,
-           fill=CREAM, anchor="ma", **RTL, **stroke)
-    # measure the tall calligraphic glyphs so nothing overlaps
-    bbox = d.textbbox((cx, y), shape_arabic(ch["name_arabic"]), font=f_ar,
-                      anchor="ma", **RTL)
-    y = bbox[3] + (60 if not vertical else 70)
+    name_size = 110 if not vertical else 120
+    if HAS_HB:
+        name_img = hb_render_line(ch["name_arabic"], name_size, CREAM,
+                                  stroke=transparent)
+        paste_line(img, name_img, cx, y)
+        y = y + name_img.height + (60 if not vertical else 70)
+    else:
+        d.text((cx, y), shape_arabic(ch["name_arabic"]), font=f_ar,
+               fill=CREAM, anchor="ma", **RTL, **stroke)
+        # measure the tall calligraphic glyphs so nothing overlaps
+        bbox = d.textbbox((cx, y), shape_arabic(ch["name_arabic"]), font=f_ar,
+                          anchor="ma", **RTL)
+        y = bbox[3] + (60 if not vertical else 70)
     d.text((cx, y), f"SURAH {ch['name_simple'].upper()} ({ch['id']})",
            font=f_big, fill=GOLD, anchor="ma", **stroke)
     y += 90 if not vertical else 100
