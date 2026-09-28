@@ -587,16 +587,24 @@ def make_bg_clip(path, W, H, total):
         v = VideoFileClip(path)
         n = max(1, math.ceil(total / v.duration))
         bg = concatenate_videoclips([v] * n).with_duration(total)
+        vw, vh = bg.size
+        bg = bg.resized(max(W / vw, H / vh))
+        w2, h2 = bg.size
+        bg = bg.cropped(x_center=w2 / 2, y_center=h2 / 2, width=W, height=H)
     else:
-        arr = np.array(PILImage.open(path).convert("RGB"))
-        bg = ImageClip(arr).with_duration(total)
-
-    vw, vh = bg.size
-    bg = bg.resized(max(W / vw, H / vh))
-    w2, h2 = bg.size
-    bg = bg.cropped(x_center=w2 / 2, y_center=h2 / 2, width=W, height=H)
+        # Cover-crop once with PIL: far cheaper and leaner than a per-frame
+        # moviepy resized/cropped transform during the encode loop.
+        img = PILImage.open(path).convert("RGB")
+        scale = max(W / img.width, H / img.height)
+        img = img.resize((max(1, int(img.width * scale + 0.5)),
+                          max(1, int(img.height * scale + 0.5))),
+                         PILImage.LANCZOS)
+        x = (img.width - W) // 2
+        y = (img.height - H) // 2
+        img = img.crop((x, y, x + W, y + H))
+        bg = ImageClip(np.array(img)).with_duration(total)
     return bg.with_duration(total)
-
+    """F
 
 def resolve_background(arg):
     if arg is None:
@@ -682,19 +690,14 @@ def build(args):
     total_dur = full_audio.duration
 
     # -- video layers --
-    layers = []
-    if use_bg:
-        layers.append(make_bg_clip(bg_path, W, H, total_dur))
-        # cinematic dim so text stays readable over any backdrop
-        layers.append(ColorClip((W, H), color=(0, 0, 0))
-                      .with_duration(total_dur).with_opacity(0.45))
-
+    layers = []    
     def overlay(pil_img, dur):
         arr = np.array(pil_img)
         if use_bg:
+            # float32 mask halves the memory vs the float64 default
+            mask = (arr[..., 3].astype("float32") / 255.0)
             clip = ImageClip(arr[..., :3]).with_duration(dur).with_mask(
-                ImageClip(arr[..., 3].astype(float) / 255.0,
-                          is_mask=True).with_duration(dur))
+                ImageClip(mask, is_mask=True).with_duration(dur))
         else:
             clip = ImageClip(arr[..., :3]).with_duration(dur)
         return clip.with_position("center")
@@ -705,6 +708,19 @@ def build(args):
         layers.append(overlay(pil_img, dur).with_start(t))
         t += dur
 
+    # The clips hold their own numpy copies now; release the PIL cards.
+    del segments
+    import gc
+    gc.collect(
+    
+    )
+    if use_bg:
+        layers.append(make_bg_clip(bg_path, W, H, total_dur))
+        # cinematic dim so text stays readable over any backdrop
+        layers.append(ColorClip((W, H), color=(0, 0, 0))
+                      .with_duration(total_dur).with_opacity(0.45))
+
+    def overlay(
     final = CompositeVideoClip(layers, size=(W, H)).with_audio(full_audio)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
