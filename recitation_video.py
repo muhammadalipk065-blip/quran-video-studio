@@ -52,9 +52,12 @@ RTL = {"direction": "rtl"} if HAS_RAQM else {}
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FONT_AR = os.path.join(BASE_DIR, "assets", "fonts", "AmiriQuran-Regular.ttf")
-# Fallback Arabic font for environments without libraqm: unlike Amiri
-# Quran it carries Arabic presentation forms, so pre-shaped text renders.
-FONT_AR_FALLBACK = os.path.join(BASE_DIR, "assets", "fonts", "FreeSerif.ttf")
+# Fallback Arabic fonts for environments without libraqm: unlike Amiri
+# Quran these carry Arabic presentation forms, so pre-shaped text
+# renders. Noto Naskh Arabic is a proper mushaf-style naskh;
+# FreeSerif is kept as a last resort.
+FONT_AR_FALLBACK = os.path.join(BASE_DIR, "assets", "fonts", "NotoNaskhArabic.ttf")
+FONT_AR_FALLBACK2 = os.path.join(BASE_DIR, "assets", "fonts", "FreeSerif.ttf")
 ASSETS = os.path.join(BASE_DIR, "assets")
 BG_DIR = os.path.join(ASSETS, "backgrounds")
 DEFAULT_BG = os.path.join(BG_DIR, "bg-geometric.jpg")
@@ -107,11 +110,24 @@ def latin_font(size):
 
 
 def arabic_font(size):
-    """Amiri Quran when libraqm shaping is available, else FreeSerif
-    (which carries the Arabic presentation forms the reshaper needs)."""
-    for p in (FONT_AR if HAS_RAQM else FONT_AR_FALLBACK, FONT_AR):
+    """Amiri Quran when libraqm shaping is available, else a naskh
+    fallback (which carries the Arabic presentation forms the reshaper
+    needs).
+
+    The fallback path draws pre-shaped visual-order text, so it forces
+    Pillow's BASIC layout engine: on Pillow builds that *do* ship raqm
+    (e.g. local dev machines) the default engine would otherwise apply
+    the bidi algorithm a second time and mirror the line.
+    """
+    if HAS_RAQM:
+        paths = (FONT_AR,)
+        engine = {}
+    else:
+        paths = (FONT_AR_FALLBACK, FONT_AR_FALLBACK2, FONT_AR)
+        engine = {"layout_engine": ImageFont.Layout.BASIC}
+    for p in paths:
         if os.path.exists(p):
-            return ImageFont.truetype(p, size)
+            return ImageFont.truetype(p, size, **engine)
     return ImageFont.load_default()
 
 
@@ -135,7 +151,8 @@ def shape_arabic(text):
 
 def with_verse_ornament(text, n):
     indic = str(n).translate(AR_DIGITS)
-    return f"{text} \uFD3F{indic}\uFD3E"
+    # non-breaking space: the ornament must never wrap onto its own line
+    return f"{text}\u00A0\uFD3F{indic}\uFD3E"
 
 
 def strip_html(text):
@@ -228,45 +245,93 @@ def draw_frame(W, H, header, arabic, english, footer, vertical=False,
     m = 28 if not vertical else 22
     d.rectangle([m, m, W - m, H - m], outline=GOLD, width=2)
 
-    f_head = latin_font(34 if not vertical else 40)
-    f_ar = arabic_font(76 if not vertical else 88)
-    f_en = latin_font(38 if not vertical else 44)
-    f_foot = latin_font(28 if not vertical else 32)
-
     cx = W // 2
-    y = 110 if not vertical else 200
+    max_w = W - 260 if not vertical else W - 140
+
+    def wrap_arabic(f_ar):
+        lines, cur = [], ""
+        for w in arabic.split(" "):
+            t = (cur + " " + w).strip()
+            if d.textlength(shape_arabic(t), font=f_ar, **RTL) <= max_w or not cur:
+                cur = t
+            else:
+                lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        return lines
+
+    if vertical:
+        # Vertical (Shorts) layout: the whole content block (header +
+        # Arabic + translation) is vertically centred in the frame so
+        # there is no large empty band at the bottom. Arabic auto-sizes
+        # down from 100pt until every wrapped line fits max_w.
+        f_head = latin_font(44)
+        f_en = latin_font(46)
+        f_foot = latin_font(34)
+        ar_size = 100
+        while True:
+            f_ar = arabic_font(ar_size)
+            ar_lines = wrap_arabic(f_ar)
+            if (ar_size <= 60 or all(
+                    d.textlength(shape_arabic(l), font=f_ar, **RTL) <= max_w
+                    for l in ar_lines)):
+                break
+            ar_size -= 4
+        en_lines = wrap(d, english, f_en, max_w)
+        line_h = int(ar_size * 1.85)
+        en_lh = 74
+        head_h, gap1, gap2 = 62, 44, 58
+        block_h = (head_h + gap1 + 2 + gap2
+                   + len(ar_lines) * line_h + gap2
+                   + len(en_lines) * en_lh)
+        region_top, region_bot = 170, H - 230
+        y = region_top + max(0, (region_bot - region_top - block_h) // 2)
+        d.text((cx, y), header, font=f_head, fill=GOLD, anchor="ma", **stroke)
+        y += head_h + gap1
+        d.line([(cx - 140, y), (cx + 140, y)], fill=GOLD, width=2)
+        y += 2 + gap2
+        for line in ar_lines:
+            d.text((cx, y + line_h // 2), shape_arabic(line), font=f_ar,
+                   fill=CREAM, anchor="mm", **RTL, **stroke)
+            y += line_h
+        y += gap2
+        for line in en_lines:
+            d.text((cx, y), line, font=f_en, fill=GREY, anchor="ma", **stroke)
+            y += en_lh
+        d.text((cx, H - 190), footer, font=f_foot, fill=DIM, anchor="ma",
+               **stroke)
+        return img
+
+    # Horizontal (16:9) layout — unchanged.
+    f_head = latin_font(34)
+    f_ar = arabic_font(76)
+    f_en = latin_font(38)
+    f_foot = latin_font(28)
+
+    y = 110
     d.text((cx, y), header, font=f_head, fill=GOLD, anchor="ma", **stroke)
-    y += 90 if not vertical else 110
+    y += 90
     d.line([(cx - 120, y), (cx + 120, y)], fill=GOLD, width=2)
-    y += 70 if not vertical else 110
+    y += 70
 
     # Arabic block (centred, wrapped). With libraqm the logical-order
     # text is shaped at draw time (direction="rtl"); without it each
     # line is pre-shaped to visual order by shape_arabic().
-    max_w = W - 260 if not vertical else W - 160
-    ar_lines, cur = [], ""
-    for w in arabic.split(" "):
-        t = (cur + " " + w).strip()
-        if d.textlength(shape_arabic(t), font=f_ar, **RTL) <= max_w or not cur:
-            cur = t
-        else:
-            ar_lines.append(cur)
-            cur = w
-    if cur:
-        ar_lines.append(cur)
-    line_h = int(76 * 1.9) if not vertical else int(88 * 1.9)
+    ar_lines = wrap_arabic(f_ar)
+    line_h = int(76 * 1.9)
     for line in ar_lines:
         d.text((cx, y + line_h // 2), shape_arabic(line), font=f_ar,
                fill=CREAM, anchor="mm", **RTL, **stroke)
         y += line_h
-    y += 40 if not vertical else 60
+    y += 40
 
     # Translation
     for line in wrap(d, english, f_en, max_w):
         d.text((cx, y), line, font=f_en, fill=GREY, anchor="ma", **stroke)
-        y += 58 if not vertical else 66
+        y += 58
 
-    d.text((cx, H - (110 if not vertical else 170)), footer,
+    d.text((cx, H - 110), footer,
            font=f_foot, fill=DIM, anchor="ma", **stroke)
     return img
 
@@ -298,9 +363,15 @@ def title_frame(W, H, ch, reciter_name, translation_name, channel,
     d.text((cx, y), "Recitation with English Translation",
            font=f_med, fill=GREY, anchor="ma", **stroke)
     y += 70 if not vertical else 80
-    d.text((cx, y), f"Recited by {reciter_name}  •  {translation_name}",
-           font=f_sm, fill=DIM, anchor="ma", **stroke)
-    y += 60 if not vertical else 70
+    rec_line = f"Recited by {reciter_name}  •  {translation_name}"
+    if vertical:
+        for line in wrap(d, rec_line, f_sm, W - 140):
+            d.text((cx, y), line, font=f_sm, fill=DIM, anchor="ma", **stroke)
+            y += 46
+        y += 24  # breathing room before the channel line
+    else:
+        d.text((cx, y), rec_line, font=f_sm, fill=DIM, anchor="ma", **stroke)
+        y += 60
     d.text((cx, y), channel, font=f_sm, fill=DIM, anchor="ma", **stroke)
     return img
 
