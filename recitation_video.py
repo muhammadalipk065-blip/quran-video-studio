@@ -36,6 +36,14 @@ import unicodedata
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
+from PIL import features as _pil_features
+
+# Pillow wheels for some interpreters (notably CPython 3.14) are built
+# without libraqm, in which case ``direction="rtl"`` raises ValueError.
+# Detect once; QRV_NO_RAQM=1 forces the fallback path for testing.
+HAS_RAQM = _pil_features.check("raqm") and os.environ.get("QRV_NO_RAQM") != "1"
+# Kwargs enabling RTL shaping at draw time -- only valid with libraqm.
+RTL = {"direction": "rtl"} if HAS_RAQM else {}
 
 
 # ----------------------------------------------------------------------------
@@ -44,6 +52,9 @@ from PIL import Image, ImageDraw, ImageFont
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FONT_AR = os.path.join(BASE_DIR, "assets", "fonts", "AmiriQuran-Regular.ttf")
+# Fallback Arabic font for environments without libraqm: unlike Amiri
+# Quran it carries Arabic presentation forms, so pre-shaped text renders.
+FONT_AR_FALLBACK = os.path.join(BASE_DIR, "assets", "fonts", "FreeSerif.ttf")
 ASSETS = os.path.join(BASE_DIR, "assets")
 BG_DIR = os.path.join(ASSETS, "backgrounds")
 DEFAULT_BG = os.path.join(BG_DIR, "bg-geometric.jpg")
@@ -95,14 +106,31 @@ def latin_font(size):
     return ImageFont.load_default()
 
 
-def shape_arabic(text):
-    """Return logical-order Arabic text.
+def arabic_font(size):
+    """Amiri Quran when libraqm shaping is available, else FreeSerif
+    (which carries the Arabic presentation forms the reshaper needs)."""
+    for p in (FONT_AR if HAS_RAQM else FONT_AR_FALLBACK, FONT_AR):
+        if os.path.exists(p):
+            return ImageFont.truetype(p, size)
+    return ImageFont.load_default()
 
-    Shaping is handled by libraqm (PIL ``direction="rtl"``) with the
-    Amiri Quran font -- do NOT pre-shape with arabic_reshaper, whose
-    presentation forms this font lacks (renders as tofu boxes).
+
+def shape_arabic(text):
+    """Return display-ready Arabic text.
+
+    With libraqm the logical-order text is returned unchanged and shaped
+    at draw time via Pillow ``direction="rtl"`` with the Amiri Quran
+    font -- do NOT pre-shape in that case (its presentation forms would
+    render as tofu boxes). Without libraqm, pre-shape to visual order
+    with arabic_reshaper + python-bidi; draw without ``direction``.
     """
-    return text
+    if HAS_RAQM:
+        return text
+    from arabic_reshaper import ArabicReshaper
+    from bidi.algorithm import get_display
+    reshaper = ArabicReshaper(
+        configuration={"delete_harakat": False, "support_ligatures": True})
+    return get_display(reshaper.reshape(text))
 
 
 def with_verse_ornament(text, n):
@@ -201,7 +229,7 @@ def draw_frame(W, H, header, arabic, english, footer, vertical=False,
     d.rectangle([m, m, W - m, H - m], outline=GOLD, width=2)
 
     f_head = latin_font(34 if not vertical else 40)
-    f_ar = ImageFont.truetype(FONT_AR, 76 if not vertical else 88)
+    f_ar = arabic_font(76 if not vertical else 88)
     f_en = latin_font(38 if not vertical else 44)
     f_foot = latin_font(28 if not vertical else 32)
 
@@ -212,14 +240,14 @@ def draw_frame(W, H, header, arabic, english, footer, vertical=False,
     d.line([(cx - 120, y), (cx + 120, y)], fill=GOLD, width=2)
     y += 70 if not vertical else 110
 
-    # Arabic block (centred, wrapped) -- logical order + direction="rtl"
-    # lets libraqm shape the text correctly with the Amiri Quran font.
-    ar = shape_arabic(arabic)
+    # Arabic block (centred, wrapped). With libraqm the logical-order
+    # text is shaped at draw time (direction="rtl"); without it each
+    # line is pre-shaped to visual order by shape_arabic().
     max_w = W - 260 if not vertical else W - 160
     ar_lines, cur = [], ""
-    for w in ar.split(" "):
+    for w in arabic.split(" "):
         t = (cur + " " + w).strip()
-        if d.textlength(t, font=f_ar, direction="rtl") <= max_w or not cur:
+        if d.textlength(shape_arabic(t), font=f_ar, **RTL) <= max_w or not cur:
             cur = t
         else:
             ar_lines.append(cur)
@@ -228,8 +256,8 @@ def draw_frame(W, H, header, arabic, english, footer, vertical=False,
         ar_lines.append(cur)
     line_h = int(76 * 1.9) if not vertical else int(88 * 1.9)
     for line in ar_lines:
-        d.text((cx, y + line_h // 2), line, font=f_ar, fill=CREAM,
-               anchor="mm", direction="rtl", **stroke)
+        d.text((cx, y + line_h // 2), shape_arabic(line), font=f_ar,
+               fill=CREAM, anchor="mm", **RTL, **stroke)
         y += line_h
     y += 40 if not vertical else 60
 
@@ -252,17 +280,17 @@ def title_frame(W, H, ch, reciter_name, translation_name, channel,
     m = 28 if not vertical else 22
     d.rectangle([m, m, W - m, H - m], outline=GOLD, width=2)
     cx, cy = W // 2, H // 2
-    f_ar = ImageFont.truetype(FONT_AR, 110 if not vertical else 120)
+    f_ar = arabic_font(110 if not vertical else 120)
     f_big = latin_font(54 if not vertical else 60)
     f_med = latin_font(36 if not vertical else 42)
     f_sm = latin_font(28 if not vertical else 34)
 
     y = cy - (220 if not vertical else 320)
     d.text((cx, y), shape_arabic(ch["name_arabic"]), font=f_ar,
-           fill=CREAM, anchor="ma", direction="rtl", **stroke)
+           fill=CREAM, anchor="ma", **RTL, **stroke)
     # measure the tall calligraphic glyphs so nothing overlaps
     bbox = d.textbbox((cx, y), shape_arabic(ch["name_arabic"]), font=f_ar,
-                      anchor="ma", direction="rtl")
+                      anchor="ma", **RTL)
     y = bbox[3] + (60 if not vertical else 70)
     d.text((cx, y), f"SURAH {ch['name_simple'].upper()} ({ch['id']})",
            font=f_big, fill=GOLD, anchor="ma", **stroke)
@@ -436,7 +464,8 @@ def build(args):
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     print(f"Writing {args.out} ...")
     final.write_videofile(args.out, fps=30, codec="libx264",
-                          audio_codec="aac", preset="medium",
+                          audio_codec="aac",
+                          preset=getattr(args, "preset", "medium"),
                           ffmpeg_params=["-movflags", "+faststart"])
     print("Done.")
 
@@ -470,6 +499,10 @@ def main():
                     help="Background image/video path (jpg/png/mp4). "
                          "Default: bundled geometric wallpaper. "
                          "Use 'none' for the plain gradient.")
+    ap.add_argument("--preset", default="medium",
+                    help="x264 encoding preset (default: medium; use "
+                         "'veryfast' for very long videos like a full "
+                         "surah)")
     ap.add_argument("--out", default=None, help="Output MP4 path")
     args = ap.parse_args()
     if args.verses:

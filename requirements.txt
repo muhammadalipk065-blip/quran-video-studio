@@ -1,5 +1,7 @@
 streamlit
 requests
-pillow==12.2.0
+pillow==11.3.0
 moviepy==2.2.1
 numpy
+arabic-reshaper==3.0.1
+python-bidi==0.6.11
